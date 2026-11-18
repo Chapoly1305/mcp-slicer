@@ -2,8 +2,11 @@
 from mcp.server.mcpserver import MCPServer
 from mcp.types import TextContent, ImageContent
 import requests
+import atexit
 import json
 import base64
+import os
+import uuid
 from urllib.parse import urlparse
 from typing import Optional
 from io import BytesIO
@@ -12,7 +15,7 @@ from PIL import Image
 # Create an MCP server (MCP SDK 2.x: FastMCP renamed to MCPServer)
 mcp = MCPServer("SlicerMCP")
 
-SLICER_WEB_SERVER_URL = "http://localhost:2016/slicer"
+SLICER_WEB_SERVER_URL = os.environ.get("SLICER_WEB_SERVER_URL", "http://localhost:2016/slicer").rstrip("/")
 
 
 def get_proxy_config(url: str) -> Optional[dict]:
@@ -44,10 +47,160 @@ def get_proxy_config(url: str) -> Optional[dict]:
     # if available via HTTP_PROXY, HTTPS_PROXY environment variables
     return None
 
+# One pooled HTTP client per MCP server process: connections to Slicer are reused
+# instead of being opened for every tool call.
+_http = requests.Session()
+if get_proxy_config(SLICER_WEB_SERVER_URL) is not None:
+    # Loopback Slicer: ignore HTTP(S)_PROXY settings entirely (a per-request
+    # proxies={...: None} does not override environment proxies on a Session).
+    _http.trust_env = False
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+#
+# Several agents may share one Slicer instance. Each agent works in its own
+# Slicer web server session (requires a Slicer WebServer with session support):
+# a private Python namespace for execute_python_code, ownership tracking of the
+# nodes it creates, and deletes that only affect its own nodes. Sessions are
+# light-weight: the scene, loaded data and views are shared, not copied.
+#
+# Every MCP server process gets a default session, so separate agent processes
+# are isolated automatically. Agents that share one MCP server process (e.g.
+# sub-agents) should call create_session and pass the returned id as `session`.
+#
+# Environment:
+#   SLICER_MCP_SESSION  default session id (kept when the process exits);
+#                       "shared" or "none" disables sessions (legacy behavior).
+# ---------------------------------------------------------------------------
+
+_SESSION_ENV = os.environ.get("SLICER_MCP_SESSION", "").strip()
+if _SESSION_ENV.lower() in ("shared", "none"):
+    DEFAULT_SESSION = None
+else:
+    DEFAULT_SESSION = _SESSION_ENV or f"mcp-{uuid.uuid4().hex[:8]}"
+_DEFAULT_SESSION_IS_EPHEMERAL = not _SESSION_ENV
+_default_session_used = False
+
+
+def _resolve_session(session: Optional[str]) -> Optional[str]:
+    """Session id to send to Slicer: explicit one, else this process' default."""
+    global _default_session_used
+    if session:
+        return session
+    if DEFAULT_SESSION:
+        _default_session_used = True
+    return DEFAULT_SESSION
+
+
+def _slicer_request(method: str, path: str, session: Optional[str] = None,
+                    params: Optional[dict] = None, **kwargs) -> requests.Response:
+    """Send a request to the Slicer web server within a session."""
+    params = dict(params or {})
+    session_id = _resolve_session(session)
+    if session_id:
+        params["session"] = session_id
+    url = f"{SLICER_WEB_SERVER_URL}{path}"
+    return _http.request(method, url, params=params, **kwargs)
+
+
+def _session_api(method: str, path: str = "", params: Optional[dict] = None) -> dict:
+    url = f"{SLICER_WEB_SERVER_URL}/session{path}"
+    try:
+        response = _http.request(method, url, params=params or {})
+        data = response.json()
+    except json.JSONDecodeError:
+        return {"error": f"Invalid JSON response (HTTP {response.status_code}): {response.text[:200]}"}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Connection error: {str(e)}"}
+    if response.status_code != 200:
+        message = data.get("message", "") if isinstance(data, dict) else str(data)
+        if "unknown command" in message:
+            message = ("This Slicer WebServer does not support sessions; "
+                       "requests from all agents share one namespace. ") + message
+        return {"error": message}
+    return data
+
+
+@atexit.register
+def _close_default_session() -> None:
+    # Free the namespace of this process' auto-generated session. Nodes are kept
+    # (so results stay visible in Slicer) but released from session ownership.
+    if DEFAULT_SESSION and _DEFAULT_SESSION_IS_EPHEMERAL and _default_session_used:
+        try:
+            _http.delete(f"{SLICER_WEB_SERVER_URL}/session/{DEFAULT_SESSION}",
+                         params={"removeNodes": "false"}, timeout=2)
+        except Exception:
+            pass
+
+
+@mcp.tool()
+def create_session(name: str = None, session_id: str = None) -> dict:
+    """
+    Create (or resume) an isolated Slicer session for one agent.
+
+    Use this when several agents share this MCP server (e.g. sub-agents): each
+    agent creates its own session and passes the returned "id" as the `session`
+    argument of every other tool. Without `session`, tools use this MCP
+    process' default session.
+
+    Within a session, execute_python_code variables are private to the session,
+    nodes created are tagged as owned by it, and deletes only affect its own
+    nodes. The scene, loaded data and views are shared (not copied), so sessions
+    are cheap and existing nodes can be read and reused by every session.
+
+    Parameters:
+        name: Optional human-readable name (e.g. the agent's task).
+        session_id: Optional id to create or resume (1-64 chars of A-Z a-z 0-9 _ . -).
+            Reusing an id resumes that session with its variables and nodes.
+
+    Returns the session info: {"id", "name", "nodeIDs", "variables", ...} or {"error": ...}.
+    """
+    params = {}
+    if name:
+        params["name"] = name
+    if session_id:
+        params["id"] = session_id
+    return _session_api("POST", params=params)
+
+
+@mcp.tool()
+def list_sessions() -> dict:
+    """
+    List the sessions active in Slicer and this MCP process' default session.
+
+    Returns {"default_session": str|None, "sessions": [{"id", "name", "nodeCount", "variables", "lastAccess", ...}]}
+    or {"error": ...}.
+    """
+    result = _session_api("GET")
+    result["default_session"] = DEFAULT_SESSION
+    return result
+
+
+@mcp.tool()
+def close_session(session: str = None, remove_nodes: bool = True) -> dict:
+    """
+    Close a session and free its Python namespace.
+
+    Parameters:
+        session: Session id to close (default: this MCP process' default session).
+        remove_nodes: If True (default), remove the nodes this session created
+            from the scene. If False, keep them in the scene for others to use.
+
+    Returns {"success": True, "removedNodeIDs": [...]} or {"error": ...}.
+    """
+    session_id = session or DEFAULT_SESSION
+    if not session_id:
+        return {"error": "No session specified and sessions are disabled for this MCP process"}
+    return _session_api("DELETE", f"/{session_id}",
+                        params={"removeNodes": "true" if remove_nodes else "false"})
+
+
 # Add list_nodes tool
 @mcp.tool()
-def list_nodes(filter_type: str = "names", class_name: str = None, 
-              name: str = None, id: str = None) -> dict:
+def list_nodes(filter_type: str = "names", class_name: str = None,
+              name: str = None, id: str = None, session: str = None,
+              only_session_nodes: bool = False) -> dict:
     """
     List MRML nodes via the Slicer Web Server API.
 
@@ -59,6 +212,9 @@ def list_nodes(filter_type: str = "names", class_name: str = None,
     The class_name parameter allows filtering nodes by class name.
     The name parameter allows filtering nodes by name.
     The id parameter allows filtering nodes by ID.
+    The session parameter selects the session (default: this MCP process' default session).
+    If only_session_nodes is True, only nodes created in that session are listed;
+    otherwise all nodes of the shared scene are listed.
 
     Examples:
     - List the names of all nodes: {"tool": "list_nodes", "arguments": {"filter_type": "names"}}
@@ -84,10 +240,10 @@ def list_nodes(filter_type: str = "names", class_name: str = None,
         if filter_type not in endpoint_map:
             return {"error": "Invalid filter_type specified"}
             
-        api_url = f"{SLICER_WEB_SERVER_URL}{endpoint_map[filter_type]}"
-        
         # Build query parameters
         params = {}
+        if only_session_nodes:
+            params["scope"] = "session"
         if class_name:
             params["class"] = class_name
         if name:
@@ -97,7 +253,7 @@ def list_nodes(filter_type: str = "names", class_name: str = None,
 
         # Send GET request to Slicer Web Server
         # Smart proxy handling: disable for localhost, use system default for others
-        response = requests.get(api_url, params=params, proxies=get_proxy_config(api_url))
+        response = _slicer_request("GET", endpoint_map[filter_type], session=session, params=params)
         response.raise_for_status()
         
         # Process response based on filter type
@@ -118,7 +274,7 @@ def list_nodes(filter_type: str = "names", class_name: str = None,
 
 # Add execute_python_code tool
 @mcp.tool()
-def execute_python_code(code: str) -> dict:
+def execute_python_code(code: str, session: str = None) -> dict:
     """
     Execute Python code in 3D Slicer.
 
@@ -127,6 +283,12 @@ def execute_python_code(code: str) -> dict:
 
     The code parameter is a string containing the Python code to be executed in 3D Slicer's Python environment.
     The code should be executable by Python's `exec()` function. To get return values, the code should assign the result to a variable named `__execResult`.
+
+    session (str, optional): Session id (from create_session). Default: this MCP process' default session.
+    Variables persist between calls of the same session and are invisible to other sessions.
+    Nodes added to the scene are owned by the session; `__session__.nodes()` lists them.
+    The scene is shared: reuse existing nodes (e.g. loaded volumes) instead of loading copies,
+    and do not modify or remove nodes that other sessions own.
 
     Examples:
     - Create a sphere model: {"tool": "execute_python_code", "arguments": {"code": "sphere = slicer.vtkMRMLModelNode(); slicer.mrmlScene.AddNode(sphere); sphere.SetName('MySphere'); __execResult = sphere.GetID()"}}
@@ -151,11 +313,9 @@ def execute_python_code(code: str) -> dict:
     - Connection error: {"success": False, "message": "Connection error: ..."}
     - HTTP error: {"success": False, "message": "HTTP Error 404: Not Found"}
     """
-    api_url = f"{SLICER_WEB_SERVER_URL}/exec"
     headers = {'Content-Type': 'text/plain'}
     try:
-        # Smart proxy handling: disable for localhost, use system default for others
-        response = requests.post(api_url, data=code.encode('utf-8'), headers=headers, proxies=get_proxy_config(api_url))
+        response = _slicer_request("POST", "/exec", session=session, data=code.encode('utf-8'), headers=headers)
         result_data = response.json()
         
         if isinstance(result_data, dict) and not result_data.get("success", True):
@@ -191,7 +351,8 @@ def capture_screenshot(
     view_type: str = "application",
     view_name: str = None,
     camera_axis: str = None,
-    image_size: int = None
+    image_size: int = None,
+    session: str = None
 ) -> list:
     """Capture a screenshot from 3D Slicer for visual inspection.
 
@@ -231,6 +392,9 @@ def capture_screenshot(
             "P" (Posterior), "I" (Inferior), "S" (Superior).
             Only used when ``view_type="3d"``.
 
+        session (Optional[str]): Session id (default: this MCP process'
+            default session). Note that views are shared by all sessions.
+
         image_size (Optional[int]): Target pixel size for the output image.
             - For slice views, this is treated as a maximum for the
               longer side of the captured pixmap; the image is scaled
@@ -264,7 +428,7 @@ def capture_screenshot(
     try:
         # Determine behavior based on view_type
         if view_type == "application":
-            api_url = f"{SLICER_WEB_SERVER_URL}/screenshot"
+            api_path = "/screenshot"
             params = {}
             description = "full application window"
             
@@ -278,11 +442,11 @@ def capture_screenshot(
                 view_name=view_name,
                 image_size=image_size,
             )
-            result = execute_python_code(python_code)
+            result = execute_python_code(python_code, session=session)
             return _parse_slice_screenshot_result(result)
                 
         elif view_type == "3d":
-            api_url = f"{SLICER_WEB_SERVER_URL}/threeD"
+            api_path = "/threeD"
             params = {}
             description = "3D view"
             
@@ -296,7 +460,7 @@ def capture_screenshot(
 
         # Make the request to Slicer Web Server
         # Smart proxy handling: disable for localhost, use system default for others
-        response = requests.get(api_url, params=params, proxies=get_proxy_config(api_url))
+        response = _slicer_request("GET", api_path, session=session, params=params)
         response.raise_for_status()
         
         # Check if response is an image
